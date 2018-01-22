@@ -14,6 +14,7 @@
 #include <ESP8266WiFi.h>        // https://github.com/esp8266/Arduino
 #include <ESP8266httpUpdate.h>  // ota update for esp8266
 #include <PubSubClient.h>       // https://github.com/knolleary/pubsubclient/releases/tag/v2.6
+#include <FastLED.h>            // FastLED
 #include "config.h"
 
 // macros for debugging
@@ -26,7 +27,7 @@
 #endif
 
 // Board properties
-#define           FW_VERSION                "1.0"
+#define           FW_VERSION                "sonoff-led V1.2"
 
 // MQTT
 #define           MQTT_ON_PAYLOAD           "1"
@@ -37,32 +38,37 @@
 #define           MQTT_TOPIC_SYSTEM_VERSION "system/version"
 #define           MQTT_TOPIC_SYSTEM_UPDATE  "system/update"
 #define           MQTT_TOPIC_SYSTEM_RESET   "system/reset"
+#define           MQTT_TOPIC_SYSTEM_ONLINE  "system/online"
 
-#define           MQTT_TOPIC_BELL           "bell/state"
-#define           MQTT_TOPIC_DOOR_BUZZER    "door/switch"
-#define           MQTT_TOPIC_DOOR_REED      "door/state"
+#define           MQTT_TOPIC_RELAY_POWER    "relay/power"
+#define           MQTT_TOPIC_RELAY_STATE    "relay/state"
+#define           MQTT_TOPIC_LED_MATRIX     "led/matrix"
 
 char              MQTT_CLIENT_ID[7]                               = {0};
 char              MQTT_ENDPOINT_SYS_VERSION[MQTT_ENDPOINT_SIZE]   = {0};
 char              MQTT_ENDPOINT_SYS_UPDATE[MQTT_ENDPOINT_SIZE]    = {0};
 char              MQTT_ENDPOINT_SYS_RESET[MQTT_ENDPOINT_SIZE]     = {0};
+char              MQTT_ENDPOINT_SYS_ONLINE[MQTT_ENDPOINT_SIZE]    = {0};
 
-char              MQTT_ENDPOINT_BELL[MQTT_ENDPOINT_SIZE]          = {0};
-char              MQTT_ENDPOINT_DOOR_BUZZER[MQTT_ENDPOINT_SIZE]   = {0};
-char              MQTT_ENDPOINT_DOOR_REED[MQTT_ENDPOINT_SIZE]     = {0};
+char              MQTT_ENDPOINT_RELAY_POWER[MQTT_ENDPOINT_SIZE]   = {0};
+char              MQTT_ENDPOINT_RELAY_STATE[MQTT_ENDPOINT_SIZE]   = {0};
+char              MQTT_ENDPOINT_LED_MATRIX[MQTT_ENDPOINT_SIZE]    = {0};
 
 enum CMD {
   CMD_NOT_DEFINED,
-  CMD_DOOR_BUZZER,
-  CMD_BELL_CHANGED,
-  CMD_DOOR_REED_CHANGED,
+  CMD_BUTTON_CHANGED
 };
 volatile uint8_t cmd = CMD_NOT_DEFINED;
 
-unsigned long buzzerStart                    = 0;
-#ifdef DEBUG
-  unsigned long lastPing                       = 0;
-#endif
+uint8_t           relayState                                        = HIGH;         // HIGH: closed switch
+uint8_t           sensorState                                       = HIGH;         // HIGH: opened switch
+uint8_t           currentSensorState                                = sensorState;  // HIGH: opened switch
+uint8_t           buttonState                                       = HIGH;         // HIGH: opened switch
+uint8_t           currentButtonState                                = buttonState;
+long              buttonStartPressed                                = 0;
+long              buttonDurationPressed                             = 0;
+
+CRGB leds[MATRIX_NUM_LEDS];
 
 #ifdef TLS
 WiFiClientSecure  wifiClient;
@@ -77,6 +83,7 @@ void updateFW(char* fwUrl);
 void reset();
 void publishData(char* topic, char* payload);
 void publishState(char* topic, int state);
+void setRelayState(uint8_t _relayState);
 
 ///////////////////////////////////////////////////////////////////////////
 //   MQTT with SSL/TLS
@@ -116,10 +123,19 @@ void callback(char* topic, byte* _payload, unsigned int length) {
   // handle the MQTT topic of the received message
   _payload[length] = '\0';
   char* payload = (char*) _payload;
-  if (strcmp(topic, MQTT_ENDPOINT_DOOR_BUZZER)==0) {
+  if (strcmp(topic, MQTT_ENDPOINT_RELAY_POWER)==0) {
     if (strcmp(payload, MQTT_ON_PAYLOAD)==0) {
-      cmd = CMD_DOOR_BUZZER;
+      setRelayState(HIGH);
     }
+    if (strcmp(payload, MQTT_OFF_PAYLOAD)==0) {
+      setRelayState(LOW);
+    }
+  } else if (strcmp(topic, MQTT_ENDPOINT_LED_MATRIX)==0) {
+    if (length >= 3 * MATRIX_NUM_LEDS) {
+      //memcpy(leds, payload, sizeof(char) * MATRIX_NUM_LEDS * 3);
+      //FastLED.show();
+    }
+    publishData(MQTT_ENDPOINT_SYS_VERSION, (char*) length);
   } else if (strcmp(topic, MQTT_ENDPOINT_SYS_RESET)==0) {
     if (strcmp(payload, MQTT_ON_PAYLOAD)==0) {
       publishState(MQTT_ENDPOINT_SYS_RESET, LOW);
@@ -166,7 +182,7 @@ void reconnect() {
 
   // try to connect to the MQTT broker
   while (!mqttClient.connected()) {
-    if (mqttClient.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASS)) {
+    if (mqttClient.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASS, MQTT_ENDPOINT_SYS_ONLINE, 0, 1, "0")) {
       DEBUG_PRINTLN(F("INFO: The client is successfully connected to the MQTT broker"));
     } else {
       DEBUG_PRINTLN(F("ERROR: The connection to the MQTT broker failed"));
@@ -177,7 +193,23 @@ void reconnect() {
   mqttClient.subscribe(MQTT_ENDPOINT_SYS_RESET);
   mqttClient.subscribe(MQTT_ENDPOINT_SYS_UPDATE);
 
-  mqttClient.subscribe(MQTT_ENDPOINT_DOOR_BUZZER);
+  mqttClient.subscribe(MQTT_ENDPOINT_LED_MATRIX);
+  mqttClient.subscribe(MQTT_ENDPOINT_RELAY_POWER);
+}
+
+///////////////////////////////////////////////////////////////////////////
+//   Sonoff switch
+///////////////////////////////////////////////////////////////////////////
+/*
+ Function called to set the state of the relay
+ */
+void setRelayState(uint8_t _relayState) {
+  if (relayState == _relayState)
+    return;
+  relayState = _relayState;
+  digitalWrite(PIN_RELAY, _relayState);
+  digitalWrite(PIN_LED, (_relayState + 1) % 2);
+  publishState(MQTT_ENDPOINT_RELAY_STATE, _relayState);
 }
 
 ///////////////////////////////////////////////////////////////////////////
@@ -218,17 +250,10 @@ void reset() {
 //   ISR
 ///////////////////////////////////////////////////////////////////////////
 /*
-  Function called when the bell is rinning
+  Function called when the button is pressed
  */
-void bellInterrupt() {
-  cmd = CMD_BELL_CHANGED;
-}
-
-/*
-  Fuction called when the door is open
-*/
-void doorReedInterrupt() {
-  cmd = CMD_DOOR_REED_CHANGED;
+void buttonInterrupt() {
+  cmd = CMD_BUTTON_CHANGED;
 }
 
 /*
@@ -262,15 +287,16 @@ void setup() {
 
   // init the I/O
   pinMode(PIN_LED, OUTPUT);
-  pinMode(PIN_DOOR_BUZZER, OUTPUT);
-  pinMode(PIN_BELL, INPUT);
-  pinMode(PIN_DOOR_REED, INPUT);
-  attachInterrupt(PIN_BELL, bellInterrupt, CHANGE);
-  attachInterrupt(PIN_DOOR_REED, doorReedInterrupt, CHANGE);
+  pinMode(PIN_RELAY, OUTPUT);
+  pinMode(PIN_BUTTON, INPUT);
+  attachInterrupt(PIN_BUTTON, buttonInterrupt, CHANGE);
+  FastLED.addLeds<WS2812B, PIN_MATRIX, RGB>(leds, MATRIX_NUM_LEDS);
+  fill_solid(leds, MATRIX_NUM_LEDS, CRGB::Red);
+  FastLED.show();
 
   // switch on led and buzzer off
-  digitalWrite(PIN_LED, LOW);
-  digitalWrite(PIN_DOOR_BUZZER, LOW);
+  digitalWrite(PIN_LED, LOW); //low is led on
+  digitalWrite(PIN_RELAY, LOW);
 
   // connect to wifi
   connectWiFi();
@@ -284,10 +310,11 @@ void setup() {
   sprintf(MQTT_ENDPOINT_SYS_VERSION, "%s%06X/%s", MQTT_TOPIC_BASE, ESP.getChipId(), MQTT_TOPIC_SYSTEM_VERSION);
   sprintf(MQTT_ENDPOINT_SYS_UPDATE, "%s%06X/%s", MQTT_TOPIC_BASE, ESP.getChipId(), MQTT_TOPIC_SYSTEM_UPDATE);
   sprintf(MQTT_ENDPOINT_SYS_RESET, "%s%06X/%s", MQTT_TOPIC_BASE, ESP.getChipId(), MQTT_TOPIC_SYSTEM_RESET);
+  sprintf(MQTT_ENDPOINT_SYS_ONLINE, "%s%06X/%s", MQTT_TOPIC_BASE, ESP.getChipId(), MQTT_TOPIC_SYSTEM_ONLINE);
 
-  sprintf(MQTT_ENDPOINT_BELL, "%s%06X/%s", MQTT_TOPIC_BASE, ESP.getChipId(), MQTT_TOPIC_BELL);
-  sprintf(MQTT_ENDPOINT_DOOR_BUZZER, "%s%06X/%s", MQTT_TOPIC_BASE, ESP.getChipId(), MQTT_TOPIC_DOOR_BUZZER);
-  sprintf(MQTT_ENDPOINT_DOOR_REED, "%s%06X/%s", MQTT_TOPIC_BASE, ESP.getChipId(), MQTT_TOPIC_DOOR_REED);
+  sprintf(MQTT_ENDPOINT_RELAY_POWER, "%s%06X/%s", MQTT_TOPIC_BASE, ESP.getChipId(), MQTT_TOPIC_RELAY_POWER);
+  sprintf(MQTT_ENDPOINT_RELAY_STATE, "%s%06X/%s", MQTT_TOPIC_BASE, ESP.getChipId(), MQTT_TOPIC_RELAY_STATE);
+  sprintf(MQTT_ENDPOINT_LED_MATRIX, "%s%06X/%s", MQTT_TOPIC_BASE, ESP.getChipId(), MQTT_TOPIC_LED_MATRIX);
 
 #ifdef TLS
   // check the fingerprint of io.adafruit.com's SSL cert
@@ -303,6 +330,7 @@ void setup() {
 
   // publish running firmware version
   publishData(MQTT_ENDPOINT_SYS_VERSION, (char*) FW_VERSION);
+  publishState(MQTT_ENDPOINT_SYS_ONLINE, 1);
 
   digitalWrite(PIN_LED, HIGH);
 }
@@ -315,46 +343,30 @@ void loop() {
   }
   mqttClient.loop();
 
-#ifdef DEBUG
-  // ping every 30 seconds the current version to server
-  if (lastPing == 0 || millis() - lastPing >= 1000 * 10){
-    lastPing = millis();
-    publishData(MQTT_ENDPOINT_SYS_VERSION, (char*) FW_VERSION);
-  }
-#endif
-
   yield();
 
   switch (cmd) {
     case CMD_NOT_DEFINED:
       // do nothing
       break;
-    case CMD_DOOR_BUZZER:
-      DEBUG_PRINTLN(F("Info: buzzer"));
-      digitalWrite(PIN_DOOR_BUZZER, HIGH);
-      digitalWrite(PIN_LED, LOW); // led is inverted, so LOW => led is on
-      buzzerStart = millis();
+    case CMD_BUTTON_CHANGED:
+      currentButtonState = digitalRead(PIN_BUTTON);
+      if (buttonState != currentButtonState) {
+        // tests if the button is released or pressed
+        if (buttonState == LOW && currentButtonState == HIGH) {
+          buttonDurationPressed = millis() - buttonStartPressed;
+          if (buttonDurationPressed < 500) {
+            setRelayState(relayState == HIGH ? LOW : HIGH);
+          } else {
+            reset();
+          }
+        } else if (buttonState == HIGH && currentButtonState == LOW) {
+          buttonStartPressed = millis();
+        }
+        buttonState = currentButtonState;
+      }
       cmd = CMD_NOT_DEFINED;
       break;
-    case CMD_BELL_CHANGED:
-      publishState(MQTT_ENDPOINT_BELL, digitalRead(PIN_BELL));
-      cmd = CMD_NOT_DEFINED;
-      break;
-    case CMD_DOOR_REED_CHANGED:
-      publishState(MQTT_ENDPOINT_DOOR_REED, digitalRead(PIN_DOOR_REED));
-      cmd = CMD_NOT_DEFINED;
-      break;
-  }
-
-  yield();
-
-  // reset door buzzer after 2 seconds
-  if (buzzerStart != 0 && millis() - buzzerStart >= 1000 * 2) {
-    DEBUG_PRINTLN(F("Info: buzzer reset"));
-    digitalWrite(PIN_DOOR_BUZZER, LOW);
-    digitalWrite(PIN_LED, HIGH); // led is inverted, so LOW => led is on
-    publishState(MQTT_ENDPOINT_DOOR_BUZZER, LOW);
-    buzzerStart = 0;
   }
 
   yield();
