@@ -131,11 +131,15 @@ void callback(char* topic, byte* _payload, unsigned int length) {
       setRelayState(LOW);
     }
   } else if (strcmp(topic, MQTT_ENDPOINT_LED_MATRIX)==0) {
-    if (length >= 3 * MATRIX_NUM_LEDS) {
-      //memcpy(leds, payload, sizeof(char) * MATRIX_NUM_LEDS * 3);
-      //FastLED.show();
+    if (length == 15) {
+      int id;
+      int r, g, b;
+      sscanf(payload, "%d:%d:%d:%d", &id, &r, &g, &b);
+      leds[id].r = r;
+      leds[id].g = g;
+      leds[id].b = b;
+      FastLED.show();
     }
-    publishData(MQTT_ENDPOINT_SYS_VERSION, (char*) length);
   } else if (strcmp(topic, MQTT_ENDPOINT_SYS_RESET)==0) {
     if (strcmp(payload, MQTT_ON_PAYLOAD)==0) {
       publishState(MQTT_ENDPOINT_SYS_RESET, LOW);
@@ -290,8 +294,8 @@ void setup() {
   pinMode(PIN_RELAY, OUTPUT);
   pinMode(PIN_BUTTON, INPUT);
   attachInterrupt(PIN_BUTTON, buttonInterrupt, CHANGE);
-  FastLED.addLeds<WS2812B, PIN_MATRIX, RGB>(leds, MATRIX_NUM_LEDS);
-  fill_solid(leds, MATRIX_NUM_LEDS, CRGB::Red);
+  FastLED.addLeds<WS2812B, PIN_MATRIX, GRB>(leds, MATRIX_NUM_LEDS);
+  fill_solid(leds, MATRIX_NUM_LEDS, CRGB::Black);
   FastLED.show();
 
   // switch on led and buzzer off
