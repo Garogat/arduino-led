@@ -1,12 +1,8 @@
-# sonoff-led
-Sketch to control fastled matrix via mqtt.
+# arduino-led
+Sketch to control fastled matrix via serial.
 
 ## setup
 Copy config.example.h to config.h and edit settings
 
 ## required libraries
-* PubSubClient
 * FastLed
-
-## credits
-https://github.com/mertenats/Itead_Sonoff
